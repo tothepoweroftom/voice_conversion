@@ -1,7 +1,8 @@
+#include <portaudio.h>
 #include <onnxruntime_cxx_api.h>
-#include "../lib/tinywav/myk_tiny.h"
 #include <iostream>
 #include <vector>
+#include <memory>
 #include <chrono>
 
 // Takes in a ref to the session, and does inference on the input block
@@ -70,33 +71,53 @@ processBlock(Ort::Session& session,
       std::make_unique<Ort::Value>(std::move(output_tensors[4]));
 }
 
+const int BLOCK_SIZE = 512;
+
+struct AudioData
+{
+    std::vector<float> buffer;
+    Ort::Session* session;
+    std::unique_ptr<Ort::Value>* enc_buf_tensor;
+    std::unique_ptr<Ort::Value>* dec_buf_tensor;
+    std::unique_ptr<Ort::Value>* out_buf_tensor;
+    std::unique_ptr<Ort::Value>* convnet_pre_ctx_tensor;
+};
+
+static int
+paCallback(const void* inputBuffer,
+           void* outputBuffer,
+           unsigned long framesPerBuffer,
+           const PaStreamCallbackTimeInfo* timeInfo,
+           PaStreamCallbackFlags statusFlags,
+           void* userData)
+{
+    AudioData* data = (AudioData*)userData;
+    const float* in = (const float*)inputBuffer;
+    float* out      = (float*)outputBuffer;
+
+    std::vector<float> block(in, in + framesPerBuffer);
+    processBlock(*data->session,
+                 block,
+                 *data->enc_buf_tensor,
+                 *data->dec_buf_tensor,
+                 *data->out_buf_tensor,
+                 *data->convnet_pre_ctx_tensor);
+
+    std::copy(block.begin(), block.end(), out);
+
+    return paContinue;
+}
+
 int
 main()
 {
-    const char* inputPath  = "/Users/thomaspower/Developer/Koala/LLVC_Test/"
-                             "test_audio/174-50561-0000.wav";
-    const char* outputPath = "/Users/thomaspower/Developer/Koala/LLVC_Test/"
-                             "output_audio/outputsample.wav";
-    const char* modelPath  = "/Users/thomaspower/Developer/Koala/LLVC_Test/"
-                             "onnx_models/llvc_model.onnx";
+    const char* modelPath = "/Users/thomaspower/Developer/Koala/LLVC_Test/"
+                            "onnx_models/llvc_model.onnx";
 
     try
     {
-        // Load audio
-        int inputSampleRate = 16000, inputChannels = 1;
-        std::vector<float> audio = myk_tiny::loadWav(inputPath);
-        std::vector<float> outSignal(audio.size(), 0.0f);
-        if (audio.empty())
-        {
-            std::cerr << "Failed to load audio or audio is empty." << std::endl;
-            return 1;
-        }
-        std::cout << "Loaded audio. Sample count: " << audio.size()
-                  << ", Sample rate: " << inputSampleRate
-                  << ", Channels: " << inputChannels << std::endl;
-
         // Set up ONNX Runtime
-        Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "llvc_test");
+        Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "llvc_realtime");
         Ort::SessionOptions session_options;
         session_options.SetIntraOpNumThreads(1);
         session_options.SetGraphOptimizationLevel(
@@ -144,48 +165,65 @@ main()
                                           convnet_pre_ctx_shape.data(),
                                           convnet_pre_ctx_shape.size()));
 
-        const int blockSize = 1024;
-
-        // Measure the total time taken for processing
-        auto start_time = std::chrono::high_resolution_clock::now();
-
-        // Break the audio into blocks and process each block
-        std::vector<float> block(blockSize, 0.0f);
-        for (auto s = 0; s + blockSize < audio.size(); s += blockSize)
+        // Initialize PortAudio
+        PaError err = Pa_Initialize();
+        if (err != paNoError)
         {
-            auto block_start_time = std::chrono::high_resolution_clock::now();
-
-            std::copy(
-              audio.begin() + s, audio.begin() + s + blockSize, block.begin());
-            processBlock(session,
-                         block,
-                         enc_buf_tensor,
-                         dec_buf_tensor,
-                         out_buf_tensor,
-                         convnet_pre_ctx_tensor);
-            // copy block to outSignal
-            std::copy(block.begin(), block.end(), outSignal.begin() + s);
-
-            auto block_end_time = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double> block_duration =
-              block_end_time - block_start_time;
+            std::cerr << "PortAudio error: " << Pa_GetErrorText(err)
+                      << std::endl;
+            return 1;
         }
 
-        auto end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> total_duration = end_time - start_time;
-        std::cout << "Processed audio in " << total_duration.count()
-                  << " seconds." << std::endl;
+        AudioData data = { std::vector<float>(BLOCK_SIZE),
+                           &session,
+                           &enc_buf_tensor,
+                           &dec_buf_tensor,
+                           &out_buf_tensor,
+                           &convnet_pre_ctx_tensor };
+        PaStream* stream;
+        err = Pa_OpenDefaultStream(&stream,
+                                   1,          // Input channels
+                                   1,          // Output channels
+                                   paFloat32,  // Sample format
+                                   16000,      // Sample rate
+                                   BLOCK_SIZE, // Frames per buffer
+                                   paCallback, // Callback function
+                                   &data);     // User data
+        if (err != paNoError)
+        {
+            std::cerr << "PortAudio error: " << Pa_GetErrorText(err)
+                      << std::endl;
+            return 1;
+        }
 
-        // Calculate the real-time ratio
-        double audio_length_seconds =
-          static_cast<double>(audio.size()) / inputSampleRate;
-        std::cout << "Audio length: " << audio_length_seconds << " seconds."
-                  << std::endl;
-        std::cout << "Real-time factor: "
-                  << audio_length_seconds / total_duration.count() << std::endl;
+        err = Pa_StartStream(stream);
+        if (err != paNoError)
+        {
+            std::cerr << "PortAudio error: " << Pa_GetErrorText(err)
+                      << std::endl;
+            return 1;
+        }
 
-        // Save output audio
-        myk_tiny::saveWav(outSignal, 1, 16000, outputPath);
+        std::cout << "Press Enter to stop..." << std::endl;
+        std::cin.get();
+
+        err = Pa_StopStream(stream);
+        if (err != paNoError)
+        {
+            std::cerr << "PortAudio error: " << Pa_GetErrorText(err)
+                      << std::endl;
+            return 1;
+        }
+
+        err = Pa_CloseStream(stream);
+        if (err != paNoError)
+        {
+            std::cerr << "PortAudio error: " << Pa_GetErrorText(err)
+                      << std::endl;
+            return 1;
+        }
+
+        Pa_Terminate();
     }
     catch (const Ort::Exception& e)
     {
